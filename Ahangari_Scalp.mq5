@@ -7,30 +7,31 @@
 #include <Trade\Trade.mqh>
 
 //--- تنظیمات ورودی
-input double RiskPercent     = 2.0;      // ریسک در هر معامله
+input double RiskPercent     = 0.7;      // ریسک در هر معامله
 input int    TrailingStop    = 100;      // تریلینگ استاپ (پوینت)
 input int    BreakevenProfit = 80;       // سود برای ریسک فری (پوینت)
+input bool   EnableTrailingStop = false; // غیرفعال‌سازی موقت تریلینگ
 input int    RangeCandles    = 20;       
 input double MaxDailyLossPct = 5.0;      
 input color  PanelColor      = clrCyan;
 input int    EmaPeriod       = 200;
 input int    AtrPeriod       = 14;
-input double RiskReward      = 1.6;
+input double RiskReward      = 2.0;
 input int    BreakoutBufferPoints = 30;
-input int    MaxSpreadPoints = 40;
-input int    MinAtrPoints    = 120;
-input int    MinBarsBetweenEntries = 1;
+input int    MaxSpreadPoints = 65;
+input int    MinAtrPoints    = 70;
+input int    MinBarsBetweenEntries = 0;
 input bool   UseSessionFilter = true;
 input int    LondonSessionStartHour = 10;
 input int    LondonSessionEndHour = 18;
 input int    NewYorkSessionStartHour = 15;
 input int    NewYorkSessionEndHour = 23;
-input bool   UseNewsTimeFilter = true;
+input bool   UseNewsTimeFilter = false;
 input string HighImpactNewsTimes = "15:30,17:00,21:30";
 input int    NewsBlockMinutesBefore = 45;
 input int    NewsBlockMinutesAfter = 30;
-input int    MaxConsecutiveLosses = 2;
-input int    MaxTradesPerDay = 8;
+input int    MaxConsecutiveLosses = 10;
+input int    MaxTradesPerDay = 25;
 input double MaxDailyProfitPct = 0.0;
 input bool   TradeOnMonday = true;
 input bool   TradeOnTuesday = true;
@@ -38,14 +39,14 @@ input bool   TradeOnWednesday = true;
 input bool   TradeOnThursday = true;
 input bool   TradeOnFriday = true;
 input int    MaxOpenPositions = 2;
-input bool   AllowSecondPositionAfterOneToOne = true;
-input double MinimumEntryScore = 58.0;
+input bool   AllowSecondPositionAfterOneToOne = false;
+input double MinimumEntryScore = 35.0;
 input double ScoreWeightBreakout = 35.0;
 input double ScoreWeightTrend = 20.0;
 input double ScoreWeightRsi = 15.0;
 input double ScoreWeightAtr = 15.0;
 input double ScoreWeightSpread = 15.0;
-input bool   UseSmartMoneyFilter = true;
+input bool   UseSmartMoneyFilter = false;
 input bool   RequireLiquiditySweep = false;
 input bool   RequireFairValueGap = false;
 input double MinDisplacementAtrRatio = 0.8;
@@ -55,10 +56,10 @@ input double StrongSignalRiskRewardBoost = 0.4;
 input bool   UseSmcReversalMode = true;
 input bool   RequireMssForReversal = false;
 input double ScoreWeightReversal = 30.0;
-input double ReversalRiskReward = 1.3;
-input double MinimumScoreGap = 3.0;
+input double ReversalRiskReward = 2.0;
+input double MinimumScoreGap = 0.0;
 input int    MssLookbackBars = 8;
-input double MinEmaSlopePoints = 15.0;
+input double MinEmaSlopePoints = 8.0;
 input bool   RequireDisplacementForBreakout = false;
 input double ReversalMaxEmaDistanceAtr = 0.8;
 input double BreakoutMinEmaDistanceAtr = 0.15;
@@ -68,18 +69,20 @@ input double MaxDynamicEntryScoreBoost = 20.0;
 input bool   EnableFallbackEntryMode = true;
 input bool   EnableSignalDebugPanel = true;
 input bool   EnableDynamicLotScalingAfterLoss = true;
-input double LotScalePerLoss = 0.20;
-input double MinLotScaleFactor = 0.40;
+input double LotScalePerLoss = 0.25;
+input double MinLotScaleFactor = 0.35;
 input bool   EnablePartialTakeProfit = true;
 input double PartialClosePercentAtOneToOne = 0.50;
-input bool   UseDeadMarketHoursFilter = true;
+input bool   UseDeadMarketHoursFilter = false;
 input int    DeadMarketStartHour = 0;
-input int    DeadMarketEndHour = 7;
-input bool   EnableAdaptiveVolatilityFilter = true;
-input bool   BlockVeryLowVolatility = true;
+input int    DeadMarketEndHour = 8;
+input bool   EnableAdaptiveVolatilityFilter = false;
+input bool   BlockVeryLowVolatility = false;
 input double VeryLowVolatilityAtrMultiplier = 0.85;
 input double LowVolatilityAtrMultiplier = 1.20;
-input double ExtraEntryScoreInLowVolatility = 6.0;
+input double ExtraEntryScoreInLowVolatility = 8.0;
+input ENUM_TIMEFRAMES PreferredTimeframe = PERIOD_M5;
+input bool   EnableSimpleEntryMode = true;
 
 //--- متغیرهای هندل اندیکاتور
 const long ExpertMagicNumber = 202607;
@@ -780,6 +783,34 @@ double getDynamicLotScaleFactor() {
     const double rawScale = 1.0 - (ConsecutiveLossesCount * LotScalePerLoss);
     return MathMax(MinLotScaleFactor, rawScale);
 }
+double getBrokerMinimumStopDistance() {
+    const int stopsLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+    const int freezeLevelPoints = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+    const int minLevelPoints = MathMax(stopsLevelPoints, freezeLevelPoints) + 2;
+    return MathMax((double)minLevelPoints * _Point, 10.0 * _Point);
+}
+bool buildOrderPrices(const ENUM_ORDER_TYPE type, const double stopDistance, const double riskReward,
+                      double &entryPrice, double &sl, double &tp) {
+    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+    if(ask <= 0.0 || bid <= 0.0) {
+        return false;
+    }
+    const double safeStopDistance = MathMax(stopDistance, getBrokerMinimumStopDistance());
+    if(type == ORDER_TYPE_BUY) {
+        entryPrice = ask;
+        sl = NormalizeDouble(entryPrice - safeStopDistance, _Digits);
+        tp = NormalizeDouble(entryPrice + safeStopDistance * riskReward, _Digits);
+        return sl < entryPrice && tp > entryPrice;
+    }
+    if(type == ORDER_TYPE_SELL) {
+        entryPrice = bid;
+        sl = NormalizeDouble(entryPrice + safeStopDistance, _Digits);
+        tp = NormalizeDouble(entryPrice - safeStopDistance * riskReward, _Digits);
+        return sl > entryPrice && tp < entryPrice;
+    }
+    return false;
+}
 void setSignalDebugMessage(const string message) {
     SignalDebugMessage = message;
 }
@@ -886,7 +917,12 @@ void OnTick() {
         return;
     }
     if(!isNewBar()) {
-        setSignalDebugMessage("Waiting: next bar");
+        if(_Period != PreferredTimeframe) {
+            setSignalDebugMessage("Waiting: next bar (best on " + EnumToString(PreferredTimeframe) + ")");
+        }
+        else {
+            setSignalDebugMessage("Waiting: next bar");
+        }
         UpdateUI();
         return;
     }
@@ -967,6 +1003,32 @@ void OnTick() {
     const bool sellFvg = hasBearishFairValueGap();
     const bool buyMss = hasBullishMss();
     const bool sellMss = hasBearishMss();
+    if(EnableSimpleEntryMode) {
+        const bool simpleBuy = close1 > ema1
+                            && close1 > rangeHigh + breakoutBuffer * 0.35
+                            && rsi1 >= 48.0
+                            && rsi1 <= 72.0;
+        const bool simpleSell = close1 < ema1
+                             && close1 < rangeLow - breakoutBuffer * 0.35
+                             && rsi1 <= 52.0
+                             && rsi1 >= 28.0;
+        if(simpleBuy && !simpleSell) {
+            if(Execute(ORDER_TYPE_BUY, stopDistance, RiskReward)) {
+                LastEntryBarIndex = currentBarIndex;
+                setSignalDebugMessage("Entry: BUY simple");
+                UpdateUI();
+                return;
+            }
+        }
+        if(simpleSell && !simpleBuy) {
+            if(Execute(ORDER_TYPE_SELL, stopDistance, RiskReward)) {
+                LastEntryBarIndex = currentBarIndex;
+                setSignalDebugMessage("Entry: SELL simple");
+                UpdateUI();
+                return;
+            }
+        }
+    }
     const double buyBreakoutScore = calculateBuyEntryScore(isBreakoutBuy, close1, rangeHigh, rsi1, ema1, atr, spreadPoints, buySweep, buyDisplacement, buyFvg);
     const double sellBreakoutScore = calculateSellEntryScore(isBreakoutSell, close1, rangeLow, rsi1, ema1, atr, spreadPoints, sellSweep, sellDisplacement, sellFvg);
     const double buyReversalScore = calculateBuyReversalScore(close1, ema1, rsi1, atr, spreadPoints, buySweep, buyMss, buyFvg);
@@ -1009,13 +1071,17 @@ void OnTick() {
             UpdateUI();
             return;
         }
-        const bool fallbackBuy = close1 > rangeHigh + breakoutBuffer * 0.5 && close1 > ema1 && rsi1 < 74.0;
-        const bool fallbackSell = close1 < rangeLow - breakoutBuffer * 0.5 && close1 < ema1 && rsi1 > 26.0;
-        const double fallbackRiskReward = MathMax(1.2, RiskReward - 0.2);
+        const bool fallbackBuy = close1 > rangeHigh + breakoutBuffer * 0.45
+                              && close1 > ema1
+                              && rsi1 >= 45.0
+                              && rsi1 < 74.0;
+        const bool fallbackSell = close1 < rangeLow - breakoutBuffer * 0.45
+                               && close1 < ema1
+                               && rsi1 <= 55.0
+                               && rsi1 > 26.0;
+        const double fallbackRiskReward = RiskReward;
         if(fallbackBuy && !fallbackSell) {
-            const double sl = NormalizeDouble(close1 - stopDistance, _Digits);
-            const double tp = NormalizeDouble(close1 + stopDistance * fallbackRiskReward, _Digits);
-            if(Execute(ORDER_TYPE_BUY, close1, sl, tp)) {
+            if(Execute(ORDER_TYPE_BUY, stopDistance, fallbackRiskReward)) {
                 LastEntryBarIndex = currentBarIndex;
                 setSignalDebugMessage("Entry: BUY fallback");
                 UpdateUI();
@@ -1023,9 +1089,7 @@ void OnTick() {
             }
         }
         if(fallbackSell && !fallbackBuy) {
-            const double sl = NormalizeDouble(close1 + stopDistance, _Digits);
-            const double tp = NormalizeDouble(close1 - stopDistance * fallbackRiskReward, _Digits);
-            if(Execute(ORDER_TYPE_SELL, close1, sl, tp)) {
+            if(Execute(ORDER_TYPE_SELL, stopDistance, fallbackRiskReward)) {
                 LastEntryBarIndex = currentBarIndex;
                 setSignalDebugMessage("Entry: SELL fallback");
                 UpdateUI();
@@ -1052,9 +1116,7 @@ void OnTick() {
         bestRiskReward += StrongSignalRiskRewardBoost;
     }
     if(bestSignal > 0) {
-        const double sl = NormalizeDouble(close1 - stopDistance, _Digits);
-        const double tp = NormalizeDouble(close1 + stopDistance * bestRiskReward, _Digits);
-        if(Execute(ORDER_TYPE_BUY, close1, sl, tp)) {
+        if(Execute(ORDER_TYPE_BUY, stopDistance, bestRiskReward)) {
             LastEntryBarIndex = currentBarIndex;
             setSignalDebugMessage("Entry: BUY score " + DoubleToString(bestScore, 1));
             UpdateUI();
@@ -1064,9 +1126,7 @@ void OnTick() {
         UpdateUI();
         return;
     }
-    const double sl = NormalizeDouble(close1 + stopDistance, _Digits);
-    const double tp = NormalizeDouble(close1 - stopDistance * bestRiskReward, _Digits);
-    if(Execute(ORDER_TYPE_SELL, close1, sl, tp)) {
+    if(Execute(ORDER_TYPE_SELL, stopDistance, bestRiskReward)) {
         LastEntryBarIndex = currentBarIndex;
         setSignalDebugMessage("Entry: SELL score " + DoubleToString(bestScore, 1));
         UpdateUI();
@@ -1134,7 +1194,7 @@ void ManagePositions() {
                 continue;
             }
             sl = PositionGetDouble(POSITION_SL);
-            if(canUseTrailing && price_current - sl > TrailingStop * _Point) {
+            if(EnableTrailingStop && canUseTrailing && price_current - sl > TrailingStop * _Point) {
                 const double newSL = NormalizeDouble(price_current - TrailingStop * _Point, _Digits);
                 if(newSL > sl) {
                     trade.PositionModify(ticket, newSL, tp);
@@ -1149,7 +1209,7 @@ void ManagePositions() {
                 continue;
             }
             sl = PositionGetDouble(POSITION_SL);
-            if(canUseTrailing && (sl - price_current > TrailingStop * _Point || sl == 0)) {
+            if(EnableTrailingStop && canUseTrailing && (sl - price_current > TrailingStop * _Point || sl == 0)) {
                 const double newSL = NormalizeDouble(price_current + TrailingStop * _Point, _Digits);
                 if(sl == 0 || newSL < sl) {
                     trade.PositionModify(ticket, newSL, tp);
@@ -1159,11 +1219,17 @@ void ManagePositions() {
     }
 }
 
-bool Execute(ENUM_ORDER_TYPE type, double price, double sl, double tp) {
+bool Execute(ENUM_ORDER_TYPE type, double stopDistance, double riskReward) {
+    double entryPrice = 0.0;
+    double sl = 0.0;
+    double tp = 0.0;
+    if(!buildOrderPrices(type, stopDistance, riskReward, entryPrice, sl, tp)) {
+        return false;
+    }
     const double lotScale = getDynamicLotScaleFactor();
     double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0 * lotScale;
     double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double points = MathAbs(price - sl) / _Point;
+    double points = MathAbs(entryPrice - sl) / _Point;
     if(points <= 0 || tickVal <= 0.0) return false;
     double lot = NormalizeDouble(riskMoney / (points * tickVal), 2);
     double minL = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -1177,10 +1243,10 @@ bool Execute(ENUM_ORDER_TYPE type, double price, double sl, double tp) {
     }
     bool opened = false;
     if(type == ORDER_TYPE_BUY) {
-        opened = trade.Buy(lot, _Symbol, price, sl, tp);
+        opened = trade.Buy(lot, _Symbol, 0.0, sl, tp);
     }
     else {
-        opened = trade.Sell(lot, _Symbol, price, sl, tp);
+        opened = trade.Sell(lot, _Symbol, 0.0, sl, tp);
     }
     if(opened) {
         registerTrailRiskForNewestOurPosition();
