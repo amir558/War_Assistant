@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "War Assistant"
 #property link      ""
-#property version   "1.11"
+#property version   "1.12"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,6 +25,12 @@ input int    InpTradeMode        = 1; // 0 ideal, 1 normal, 2 high risk (0.5%)
 input int    InpMaxSpreadPoints  = 120;
 input int    InpSlippagePoints   = 30;
 input bool   InpOneTradePerBar   = true;
+input double InpMaxLotsHardCap   = 0.08;
+input int    InpMinStopPointsForLotSizing = 250;
+input double InpMinStopAtrMultForLotSizing = 0.75;
+input double InpMaxRiskMoneyPerTrade = 15.0;
+input double InpMaxDailyLossPercent = 4.0;
+input double InpMaxEquityDrawdownFromPeakPercent = 25.0;
 
 //--- Structure (swing / minor)
 input int    InpSwingLeft        = 2;
@@ -67,6 +73,8 @@ int      g_tradesToday       = 0;
 int      g_lastTradeDay      = -1;
 datetime g_lastRangeBuyBarTime  = 0;
 datetime g_lastRangeSellBarTime = 0;
+double   g_dayStartBalance      = 0.0;
+double   g_sessionPeakEquity    = 0.0;
 
 enum ENUM_MARKET_REGIME
 {
@@ -580,10 +588,14 @@ double normalizeVolume(double lots)
    return lots;
 }
 
-double calculateLotsByRisk(const double entryPrice, const double slPrice, const double riskPercent)
+double calculateLotsByRisk(const double entryPrice, const double slPrice, const double riskPercent, const double atrForSizing)
 {
    const double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   const double riskMoney = balance * (riskPercent / 100.0);
+   double riskMoney = balance * (riskPercent / 100.0);
+   if(InpMaxRiskMoneyPerTrade > 0.0)
+   {
+      riskMoney = MathMin(riskMoney, InpMaxRiskMoneyPerTrade);
+   }
    if(riskMoney <= 0.0)
    {
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -594,10 +606,26 @@ double calculateLotsByRisk(const double entryPrice, const double slPrice, const 
    {
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
-   const double slDistance = MathAbs(entryPrice - slPrice);
+   double slDistance = MathAbs(entryPrice - slPrice);
    if(slDistance <= 0.0)
    {
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   }
+   if(InpMinStopPointsForLotSizing > 0)
+   {
+      const double minByPoints = (double)InpMinStopPointsForLotSizing * _Point;
+      if(slDistance < minByPoints)
+      {
+         slDistance = minByPoints;
+      }
+   }
+   if(atrForSizing > 0.0 && InpMinStopAtrMultForLotSizing > 0.0)
+   {
+      const double minByAtr = InpMinStopAtrMultForLotSizing * atrForSizing;
+      if(slDistance < minByAtr)
+      {
+         slDistance = minByAtr;
+      }
    }
    const double lossPerLot = (slDistance / tickSize) * tickValue;
    if(lossPerLot <= 0.0)
@@ -605,7 +633,51 @@ double calculateLotsByRisk(const double entryPrice, const double slPrice, const 
       return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    }
    double lots = riskMoney / lossPerLot;
+   if(InpMaxLotsHardCap > 0.0)
+   {
+      lots = MathMin(lots, InpMaxLotsHardCap);
+   }
    return normalizeVolume(lots);
+}
+
+bool isDailyLossGuardTriggered()
+{
+   if(InpMaxDailyLossPercent <= 0.0 || g_dayStartBalance <= 0.0)
+   {
+      return false;
+   }
+   const double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double floorBal = g_dayStartBalance * (1.0 - InpMaxDailyLossPercent / 100.0);
+   return eq < floorBal;
+}
+
+void updateSessionEquityPeak()
+{
+   const double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq > g_sessionPeakEquity)
+   {
+      g_sessionPeakEquity = eq;
+   }
+}
+
+bool isEquityDrawdownFromPeakTooDeep()
+{
+   if(InpMaxEquityDrawdownFromPeakPercent <= 0.0)
+   {
+      return false;
+   }
+   if(g_sessionPeakEquity <= 0.0)
+   {
+      return false;
+   }
+   const double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double ddPct = 100.0 * (g_sessionPeakEquity - eq) / g_sessionPeakEquity;
+   return ddPct > InpMaxEquityDrawdownFromPeakPercent;
+}
+
+bool isNewRiskEntryBlocked()
+{
+   return isDailyLossGuardTriggered() || isEquityDrawdownFromPeakTooDeep();
 }
 
 int countOurPositions()
@@ -649,6 +721,11 @@ void resetDailyTradeCounterIfNeeded()
    {
       g_lastTradeDay = dayId;
       g_tradesToday = 0;
+      g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   }
+   if(g_dayStartBalance <= 0.0)
+   {
+      g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    }
 }
 
@@ -682,6 +759,8 @@ int OnInit()
       Print("war.mq5: failed to create ATR handles");
       return INIT_FAILED;
    }
+   g_dayStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_sessionPeakEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    return INIT_SUCCEEDED;
 }
 
@@ -697,9 +776,13 @@ void OnDeinit(const int reason)
    }
 }
 
-bool tryOpenBuy(const double slPrice, const double tpPrice, const string tag)
+bool tryOpenBuy(const double slPrice, const double tpPrice, const string tag, const double atrForLots)
 {
    resetDailyTradeCounterIfNeeded();
+   if(isNewRiskEntryBlocked())
+   {
+      return false;
+   }
    if(g_tradesToday >= InpMaxTradesPerDay)
    {
       return false;
@@ -710,7 +793,7 @@ bool tryOpenBuy(const double slPrice, const double tpPrice, const string tag)
    }
    const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    const double rp = computeRiskPercent();
-   const double lots = calculateLotsByRisk(ask, slPrice, rp);
+   const double lots = calculateLotsByRisk(ask, slPrice, rp, atrForLots);
    const string comment = "war|" + tag;
    if(!g_trade.Buy(lots, _Symbol, ask, slPrice, tpPrice, comment))
    {
@@ -721,9 +804,13 @@ bool tryOpenBuy(const double slPrice, const double tpPrice, const string tag)
    return true;
 }
 
-bool tryOpenSell(const double slPrice, const double tpPrice, const string tag)
+bool tryOpenSell(const double slPrice, const double tpPrice, const string tag, const double atrForLots)
 {
    resetDailyTradeCounterIfNeeded();
+   if(isNewRiskEntryBlocked())
+   {
+      return false;
+   }
    if(g_tradesToday >= InpMaxTradesPerDay)
    {
       return false;
@@ -734,7 +821,7 @@ bool tryOpenSell(const double slPrice, const double tpPrice, const string tag)
    }
    const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    const double rp = computeRiskPercent();
-   const double lots = calculateLotsByRisk(bid, slPrice, rp);
+   const double lots = calculateLotsByRisk(bid, slPrice, rp, atrForLots);
    const string comment = "war|" + tag;
    if(!g_trade.Sell(lots, _Symbol, bid, slPrice, tpPrice, comment))
    {
@@ -747,6 +834,7 @@ bool tryOpenSell(const double slPrice, const double tpPrice, const string tag)
 
 void OnTick()
 {
+   updateSessionEquityPeak();
    static datetime lastBarTimeSignal = 0;
    if(InpOneTradePerBar && !isNewBar(InpSignalTimeframe, lastBarTimeSignal))
    {
@@ -838,7 +926,7 @@ void OnTick()
             const bool rrOk = (riskPx > 0.0 && rewPx > 0.0 && (rewPx / riskPx) >= InpRangeMinRewardToRisk);
             if(sl < ask && tpBuy > ask && rrOk)
             {
-               if(tryOpenBuy(sl, tpBuy, "RANGE_FTB_BUY"))
+               if(tryOpenBuy(sl, tpBuy, "RANGE_FTB_BUY", atrSignal))
                {
                   g_lastRangeBuyBarTime = r[1].time;
                }
@@ -858,7 +946,7 @@ void OnTick()
             const bool rrOk = (riskPx > 0.0 && rewPx > 0.0 && (rewPx / riskPx) >= InpRangeMinRewardToRisk);
             if(sl > bidSell && tpSell < bidSell && rrOk)
             {
-               if(tryOpenSell(sl, tpSell, "RANGE_FTB_SELL"))
+               if(tryOpenSell(sl, tpSell, "RANGE_FTB_SELL", atrSignal))
                {
                   g_lastRangeSellBarTime = r[1].time;
                }
@@ -894,7 +982,7 @@ void OnTick()
       }
       if(sl < bid && tp > bid)
       {
-         tryOpenBuy(sl, tp, "MINER_BUY");
+         tryOpenBuy(sl, tp, "MINER_BUY", atrSignal);
       }
    }
    else if(twoCandleBullEngulfBreak(r[1], r[2], r[3], atrSignal, false))
@@ -911,7 +999,7 @@ void OnTick()
       }
       if(sl > bid && tp < bid)
       {
-         tryOpenSell(sl, tp, "MINER_SELL");
+         tryOpenSell(sl, tp, "MINER_SELL", atrSignal);
       }
    }
 }
