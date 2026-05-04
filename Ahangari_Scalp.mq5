@@ -67,6 +67,19 @@ input double EntryScorePenaltyPerLoss = 5.0;
 input double MaxDynamicEntryScoreBoost = 20.0;
 input bool   EnableFallbackEntryMode = true;
 input bool   EnableSignalDebugPanel = true;
+input bool   EnableDynamicLotScalingAfterLoss = true;
+input double LotScalePerLoss = 0.20;
+input double MinLotScaleFactor = 0.40;
+input bool   EnablePartialTakeProfit = true;
+input double PartialClosePercentAtOneToOne = 0.50;
+input bool   UseDeadMarketHoursFilter = true;
+input int    DeadMarketStartHour = 0;
+input int    DeadMarketEndHour = 7;
+input bool   EnableAdaptiveVolatilityFilter = true;
+input bool   BlockVeryLowVolatility = true;
+input double VeryLowVolatilityAtrMultiplier = 0.85;
+input double LowVolatilityAtrMultiplier = 1.20;
+input double ExtraEntryScoreInLowVolatility = 6.0;
 
 //--- متغیرهای هندل اندیکاتور
 const long ExpertMagicNumber = 202607;
@@ -79,6 +92,7 @@ double DayInitialEquity;
 int LastDailyBaselinePackedDate = 0;
 ulong TrailRiskTickets[];
 double TrailRiskInitialPrice[];
+ulong PartialClosedTickets[];
 datetime LastProcessedBarTime = 0;
 int LastEntryBarIndex = -10000;
 int NewsEventMinutes[];
@@ -95,6 +109,25 @@ int findTrailRiskIndex(const ulong ticket) {
         }
     }
     return -1;
+}
+int findPartialClosedIndex(const ulong ticket) {
+    for(int idx = 0; idx < ArraySize(PartialClosedTickets); idx++) {
+        if(PartialClosedTickets[idx] == ticket) {
+            return idx;
+        }
+    }
+    return -1;
+}
+bool hasPartialCloseDoneForTicket(const ulong ticket) {
+    return findPartialClosedIndex(ticket) >= 0;
+}
+void markPartialCloseDoneForTicket(const ulong ticket) {
+    if(hasPartialCloseDoneForTicket(ticket)) {
+        return;
+    }
+    const int n = ArraySize(PartialClosedTickets);
+    ArrayResize(PartialClosedTickets, n + 1);
+    PartialClosedTickets[n] = ticket;
 }
 
 void setTrailInitialRiskForTicket(const ulong ticket, const double riskPrice) {
@@ -128,6 +161,17 @@ void pruneStaleTrailRiskEntries() {
             }
             ArrayResize(TrailRiskTickets, last);
             ArrayResize(TrailRiskInitialPrice, last);
+        }
+    }
+}
+void pruneStalePartialCloseEntries() {
+    for(int idx = ArraySize(PartialClosedTickets) - 1; idx >= 0; idx--) {
+        if(!PositionSelectByTicket(PartialClosedTickets[idx])) {
+            const int last = ArraySize(PartialClosedTickets) - 1;
+            if(idx != last) {
+                PartialClosedTickets[idx] = PartialClosedTickets[last];
+            }
+            ArrayResize(PartialClosedTickets, last);
         }
     }
 }
@@ -517,6 +561,14 @@ bool isHourInsideSession(const int hour, const int startHour, const int endHour)
     }
     return hour >= startHour || hour < endHour;
 }
+bool isInsideDeadMarketHours() {
+    if(!UseDeadMarketHoursFilter) {
+        return false;
+    }
+    MqlDateTime serverDate;
+    TimeToStruct(TimeTradeServer(), serverDate);
+    return isHourInsideSession(serverDate.hour, DeadMarketStartHour, DeadMarketEndHour);
+}
 bool isInsideTradingSession() {
     if(!UseSessionFilter) {
         return true;
@@ -704,6 +756,30 @@ double getDynamicMinimumEntryScore() {
     const double scoreBoost = MathMin(MaxDynamicEntryScoreBoost, ConsecutiveLossesCount * EntryScorePenaltyPerLoss);
     return MinimumEntryScore + scoreBoost;
 }
+double getAdaptiveVolatilityEntryScoreBoost(const double atr) {
+    if(!EnableAdaptiveVolatilityFilter) {
+        return 0.0;
+    }
+    const double minimumAtrPrice = MinAtrPoints * _Point;
+    if(minimumAtrPrice <= 0.0) {
+        return 0.0;
+    }
+    if(atr >= minimumAtrPrice * LowVolatilityAtrMultiplier) {
+        return 0.0;
+    }
+    const double ratio = 1.0 - (atr / (minimumAtrPrice * LowVolatilityAtrMultiplier));
+    return MathMax(0.0, ExtraEntryScoreInLowVolatility * ratio);
+}
+double getDynamicLotScaleFactor() {
+    if(!EnableDynamicLotScalingAfterLoss) {
+        return 1.0;
+    }
+    if(ConsecutiveLossesCount <= 0) {
+        return 1.0;
+    }
+    const double rawScale = 1.0 - (ConsecutiveLossesCount * LotScalePerLoss);
+    return MathMax(MinLotScaleFactor, rawScale);
+}
 void setSignalDebugMessage(const string message) {
     SignalDebugMessage = message;
 }
@@ -824,6 +900,11 @@ void OnTick() {
         UpdateUI();
         return;
     }
+    if(isInsideDeadMarketHours()) {
+        setSignalDebugMessage("Blocked: dead market hours");
+        UpdateUI();
+        return;
+    }
     if(isInsideNewsBlockWindow()) {
         setSignalDebugMessage("Blocked: news time window");
         UpdateUI();
@@ -857,6 +938,11 @@ void OnTick() {
         UpdateUI();
         return;
     }
+    if(EnableAdaptiveVolatilityFilter && BlockVeryLowVolatility && atr < MinAtrPoints * _Point * VeryLowVolatilityAtrMultiplier) {
+        setSignalDebugMessage("Blocked: very low volatility regime");
+        UpdateUI();
+        return;
+    }
     const int highestIndex = iHighest(_Symbol, _Period, MODE_HIGH, RangeCandles, 2);
     const int lowestIndex = iLowest(_Symbol, _Period, MODE_LOW, RangeCandles, 2);
     const double rangeHigh = iHigh(_Symbol, _Period, highestIndex);
@@ -885,7 +971,8 @@ void OnTick() {
     const double sellBreakoutScore = calculateSellEntryScore(isBreakoutSell, close1, rangeLow, rsi1, ema1, atr, spreadPoints, sellSweep, sellDisplacement, sellFvg);
     const double buyReversalScore = calculateBuyReversalScore(close1, ema1, rsi1, atr, spreadPoints, buySweep, buyMss, buyFvg);
     const double sellReversalScore = calculateSellReversalScore(close1, ema1, rsi1, atr, spreadPoints, sellSweep, sellMss, sellFvg);
-    const double dynamicMinimumEntryScore = getDynamicMinimumEntryScore();
+    const double adaptiveScoreBoost = getAdaptiveVolatilityEntryScoreBoost(atr);
+    const double dynamicMinimumEntryScore = getDynamicMinimumEntryScore() + adaptiveScoreBoost;
     int bestSignal = 0;
     double bestScore = -1.0;
     double bestRiskReward = RiskReward;
@@ -994,6 +1081,7 @@ void OnTick() {
 //+------------------------------------------------------------------+
 void ManagePositions() {
     pruneStaleTrailRiskEntries();
+    pruneStalePartialCloseEntries();
     for(int i = PositionsTotal() - 1; i >= 0; i--) {
         const ulong ticket = PositionGetTicket(i);
         if(ticket == 0) {
@@ -1012,9 +1100,32 @@ void ManagePositions() {
         const double price_current = PositionGetDouble(POSITION_PRICE_CURRENT);
         double sl = PositionGetDouble(POSITION_SL);
         const double tp = PositionGetDouble(POSITION_TP);
+        double volume = PositionGetDouble(POSITION_VOLUME);
         const long posType = PositionGetInteger(POSITION_TYPE);
         const double initialRiskPrice = getTrailInitialRiskForTicket(ticket);
         const bool canUseTrailing = hasReachedOneToOneForTrail(posType, price_open, price_current, initialRiskPrice);
+        if(EnablePartialTakeProfit && canUseTrailing && !hasPartialCloseDoneForTicket(ticket)) {
+            const double minVolume = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+            const double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+            double closeVolume = volume * PartialClosePercentAtOneToOne;
+            if(lotStep > 0.0) {
+                closeVolume = MathFloor(closeVolume / lotStep) * lotStep;
+                closeVolume = NormalizeDouble(closeVolume, 2);
+            }
+            if(closeVolume >= minVolume && (volume - closeVolume) >= minVolume) {
+                if(trade.PositionClosePartial(ticket, closeVolume)) {
+                    markPartialCloseDoneForTicket(ticket);
+                    if(!PositionSelectByTicket(ticket)) {
+                        continue;
+                    }
+                    sl = PositionGetDouble(POSITION_SL);
+                    volume = PositionGetDouble(POSITION_VOLUME);
+                }
+            }
+            else {
+                markPartialCloseDoneForTicket(ticket);
+            }
+        }
         if(posType == POSITION_TYPE_BUY) {
             if(price_current - price_open > BreakevenProfit * _Point && sl < price_open) {
                 trade.PositionModify(ticket, price_open + (5 * _Point), tp);
@@ -1049,7 +1160,8 @@ void ManagePositions() {
 }
 
 bool Execute(ENUM_ORDER_TYPE type, double price, double sl, double tp) {
-    double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+    const double lotScale = getDynamicLotScaleFactor();
+    double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0 * lotScale;
     double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
     double points = MathAbs(price - sl) / _Point;
     if(points <= 0 || tickVal <= 0.0) return false;
