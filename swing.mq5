@@ -54,6 +54,24 @@ input int TradeTakeProfitPips = 100;          // حد سود (پیپ)
 input int TradeStopLossPips = 90;             // حد ضرر پایه (پیپ)
 input bool UseAdaptiveStopLoss = true;        // استفاده از حد ضرر تطبیقی با ATR
 input double StopLossAtrMultiplier = 1.1;     // ضریب ATR برای حد ضرر تطبیقی
+input bool EnableMa4DynamicTargets = false;   // فعال‌سازی حد سود/ضرر داینامیک با MA(4)
+input int DynamicTargetMaPeriod = 4;          // دوره MA برای هدف‌گذاری داینامیک
+input double DynamicBaseAtrWeight = 0.6;      // وزن ATR در پایه فاصله داینامیک
+input double DynamicBaseRangeWeight = 0.2;    // وزن عرض رنج در پایه فاصله داینامیک
+input double DynamicStopLossMultiplier = 1.2; // ضریب حد ضرر داینامیک
+input double DynamicTakeProfitMultiplier = 2.0; // ضریب حد سود داینامیک
+input double DynamicMinStopLossPips = 18.0;   // حداقل SL داینامیک (پیپ)
+input double DynamicMaxStopLossPips = 220.0;  // حداکثر SL داینامیک (پیپ)
+input double DynamicMinTakeProfitPips = 24.0; // حداقل TP داینامیک (پیپ)
+input double DynamicMaxTakeProfitPips = 400.0; // حداکثر TP داینامیک (پیپ)
+input int BreakoutBufferPips = 5;             // بافر شکست رنج برای ورود بریک‌اوت
+input bool EnableRangeBreakoutEntries = false; // ورود بریک‌اوت در LL/HH
+input int MinorStopBufferPips = 2;            // فاصله استاپ از مینور (پیپ)
+input double MinMinorStopLossPips = 30.0;     // حداقل فاصله استاپ از ورود هنگام SL مینور
+input bool EnableStrongTrendDirectionFilter = true; // ممنوعیت خلاف جهت در روند قوی
+input double BreakoutMinAtrMultiplier = 1.5;  // شرط اول شکست: حداقل قدرت کندل نسبت به ATR
+input double BreakoutMinLayerCrossPercent = 50.0; // شرط دوم شکست: عبور حداقل 50 درصد از لایه
+input double BreakoutShadowRejectBufferPips = 1.0; // شرط سوم شکست: رد شدن شَدوهای سوئینگ
 input int MaxSimultaneousTrades = 4;          // حداکثر معاملات همزمان
 input int MaxTradesPerSide = 2;               // حداکثر معامله هم‌جهت همزمان
 input int RangeTouchBufferPips = 12;          // بافر مجاز برخورد به سقف/کف رنج
@@ -97,6 +115,7 @@ CTrade trade;
 datetime lastBuyTradeBarTime = 0;
 datetime lastSellTradeBarTime = 0;
 int reentryAtrHandle = INVALID_HANDLE;
+int dynamicTargetMaHandle = INVALID_HANDLE;
 int g_prevCalculated = 0;
 int g_consecutiveSlCount = 0;
 int g_circuitBreakerBarsLeft = 0;
@@ -168,6 +187,7 @@ enum TREND_STATE
   };
 
 TREND_STATE currentTrend = TREND_RANGE;  //  توضیح فارسی
+bool isStrongTrendState = false;
 string trendLabelName = "TrendAnalysis"; //  توضیح فارسی
 SwingPointData swingHistory[8];          //  توضیح فارسی
 int swingHistoryCount = 0;               //  توضیح فارسی
@@ -303,6 +323,73 @@ double GetCurrentAtrPips()
    return atrBuffer[0] / pip;
   }
 
+double ClampValue(const double value, const double minValue, const double maxValue)
+  {
+   double clamped = value;
+   if(clamped < minValue)
+      clamped = minValue;
+   if(clamped > maxValue)
+      clamped = maxValue;
+   return clamped;
+  }
+
+double GetCurrentMaPrice()
+  {
+   if(dynamicTargetMaHandle == INVALID_HANDLE)
+      return 0.0;
+   double maBuffer[];
+   ArraySetAsSeries(maBuffer, true);
+   if(CopyBuffer(dynamicTargetMaHandle, 0, 0, 1, maBuffer) != 1)
+      return 0.0;
+   return maBuffer[0];
+  }
+
+void CalculateDynamicTargetDistances(const double entryPrice,
+                                     const double rangeLow,
+                                     const double rangeHigh,
+                                     const double atrPips,
+                                     double &slDistance,
+                                     double &tpDistance)
+  {
+   double pip = GetPipSize();
+   if(pip <= 0.0)
+     {
+      slDistance = TradeStopLossPips * _Point;
+      tpDistance = TradeTakeProfitPips * _Point;
+      return;
+     }
+   double fallbackSlPips = TradeStopLossPips;
+   if(UseAdaptiveStopLoss && atrPips > 0.0)
+      fallbackSlPips = MathMax(fallbackSlPips, atrPips * StopLossAtrMultiplier);
+   double fallbackTpPips = TradeTakeProfitPips;
+   if(!EnableMa4DynamicTargets)
+     {
+      slDistance = fallbackSlPips * pip;
+      tpDistance = fallbackTpPips * pip;
+      return;
+     }
+   double maPrice = GetCurrentMaPrice();
+   double maDistancePips = 0.0;
+   if(maPrice > 0.0)
+      maDistancePips = MathAbs(entryPrice - maPrice) / pip;
+   double rangeWidthPips = 0.0;
+   if(rangeHigh > rangeLow)
+      rangeWidthPips = (rangeHigh - rangeLow) / pip;
+   double atrComponentPips = 0.0;
+   if(atrPips > 0.0)
+      atrComponentPips = atrPips * DynamicBaseAtrWeight;
+   double rangeComponentPips = rangeWidthPips * DynamicBaseRangeWeight;
+   double baseDistancePips = MathMax(maDistancePips, MathMax(atrComponentPips, rangeComponentPips));
+   if(baseDistancePips <= 0.0)
+      baseDistancePips = fallbackSlPips;
+   double slPips = baseDistancePips * DynamicStopLossMultiplier;
+   double tpPips = baseDistancePips * DynamicTakeProfitMultiplier;
+   slPips = ClampValue(slPips, DynamicMinStopLossPips, DynamicMaxStopLossPips);
+   tpPips = ClampValue(tpPips, DynamicMinTakeProfitPips, DynamicMaxTakeProfitPips);
+   slDistance = slPips * pip;
+   tpDistance = tpPips * pip;
+  }
+
 void UpdateCircuitBreakerOnNewBar()
   {
    datetime barTime = iTime(_Symbol, _Period, 0);
@@ -348,6 +435,53 @@ bool IsMomentumTooHigh(const double atrPips)
    double momentumPips = MathAbs(closeNow - closePast) / pip;
    double momentumAtrRatio = momentumPips / atrPips;
    return (momentumAtrRatio >= MomentumAtrThreshold);
+  }
+
+bool IsDirectionAllowedByStrongTrend(const ENUM_POSITION_TYPE positionType)
+  {
+   if(!EnableStrongTrendDirectionFilter)
+      return true;
+   if(!isStrongTrendState)
+      return true;
+   if(currentTrend == TREND_UP && positionType == POSITION_TYPE_SELL)
+      return false;
+   if(currentTrend == TREND_DOWN && positionType == POSITION_TYPE_BUY)
+      return false;
+   return true;
+  }
+
+bool IsBreakoutConfirmed(const bool isUpBreakout,
+                        const double levelPrice,
+                        const double atrPips,
+                        const double pip)
+  {
+   if(pip <= 0.0 || atrPips <= 0.0)
+      return false;
+   double open1 = iOpen(_Symbol, _Period, 1);
+   double close1 = iClose(_Symbol, _Period, 1);
+   double high1 = iHigh(_Symbol, _Period, 1);
+   double low1 = iLow(_Symbol, _Period, 1);
+   if(open1 <= 0.0 || close1 <= 0.0 || high1 <= 0.0 || low1 <= 0.0)
+      return false;
+   double candleRangePips = (high1 - low1) / pip;
+   bool hasAtrPower = (candleRangePips >= (atrPips * BreakoutMinAtrMultiplier));
+   double layerCrossDistance = (BreakoutMinLayerCrossPercent / 100.0) * BreakoutBufferPips * pip;
+   if(layerCrossDistance < (0.5 * pip))
+      layerCrossDistance = 0.5 * pip;
+   double shadowRejectBuffer = BreakoutShadowRejectBufferPips * pip;
+   bool hasLayerCross = false;
+   bool hasShadowRejection = false;
+   if(isUpBreakout)
+     {
+      hasLayerCross = (close1 > (levelPrice + layerCrossDistance));
+      hasShadowRejection = (low1 > (levelPrice + shadowRejectBuffer));
+     }
+   else
+     {
+      hasLayerCross = (close1 < (levelPrice - layerCrossDistance));
+      hasShadowRejection = (high1 < (levelPrice - shadowRejectBuffer));
+     }
+   return (hasAtrPower && hasLayerCross && hasShadowRejection);
   }
 
 int FindRecoveryByPrimary(const ulong primaryTicket)
@@ -591,16 +725,10 @@ void ExecuteRangeTrading(const datetime &time[])
    double pip = GetPipSize();
    if(pip <= 0.0)
       return;
-   double buffer = RangeTouchBufferPips * pip;
    if(!IsRangeValidForTrading(rangeLow, rangeHigh, atrPips))
       return;
    if(IsMomentumTooHigh(atrPips))
       return;
-   double slPips = TradeStopLossPips;
-   if(UseAdaptiveStopLoss && atrPips > 0.0)
-      slPips = MathMax(slPips, atrPips * StopLossAtrMultiplier);
-   double slDistance = slPips * pip;
-   double tpDistance = TradeTakeProfitPips * pip;
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    if(EnableSpreadFilter)
@@ -640,6 +768,10 @@ void ExecuteRangeTrading(const datetime &time[])
    int effectiveReentryCooldownBars = GetAdaptiveReentryCooldownBars();
    bool canReenterBuy = (!EnableSideReentry) ? false : (BarsSinceTradeBar(lastBuyTradeBarTime, time) >= effectiveReentryCooldownBars);
    bool canReenterSell = (!EnableSideReentry) ? false : (BarsSinceTradeBar(lastSellTradeBarTime, time) >= effectiveReentryCooldownBars);
+   int latestBarIndexForTime = ArraySize(time) - 1;
+   if(latestBarIndexForTime < 0)
+      return;
+   datetime currentSignalBarTime = time[latestBarIndexForTime];
    // قانون ساختاری مهم:
    // فقط روی LL خرید و فقط روی HH فروش
    int latestBarIndex = ArraySize(time) - 1;
@@ -653,15 +785,86 @@ void ExecuteRangeTrading(const datetime &time[])
                                     lastHighPoint.relation == "HH" &&
                                     lastHighPoint.index == lastSwingIndex &&
                                     isFreshSwingSignal);
+   bool allowBreakoutSellFromLl = (lastSwingType == -1 &&
+                                   lastLowPoint.relation == "LL" &&
+                                   lastLowPoint.index == lastSwingIndex &&
+                                   isFreshSwingSignal);
+   bool allowBreakoutBuyFromHh = (lastSwingType == 1 &&
+                                  lastHighPoint.relation == "HH" &&
+                                  lastHighPoint.index == lastSwingIndex &&
+                                  isFreshSwingSignal);
+   double breakoutBuffer = BreakoutBufferPips * pip;
+   bool isBreakoutDown = (bid < (rangeLow - breakoutBuffer));
+   bool isBreakoutUp = (ask > (rangeHigh + breakoutBuffer));
+   bool isBreakoutDownConfirmed = IsBreakoutConfirmed(false, rangeLow, atrPips, pip);
+   bool isBreakoutUpConfirmed = IsBreakoutConfirmed(true, rangeHigh, atrPips, pip);
+   double rangeWidthPips = (rangeHigh - rangeLow) / pip;
+   bool isWideRange = (rangeWidthPips > 50.0);
+   double minorStopBuffer = MinorStopBufferPips * pip;
+   if(EnableRangeBreakoutEntries &&
+      canOpenMore &&
+      openSell < hardMaxTradesPerSide &&
+      allowBreakoutSellFromLl &&
+      isBreakoutDown &&
+      isBreakoutDownConfirmed &&
+      IsDirectionAllowedByStrongTrend(POSITION_TYPE_SELL) &&
+      (lastSellTradeBarTime == 0 || canReenterSell))
+     {
+      double breakoutSellSl = (lastHighPrice > 0.0 ? lastHighPrice : rangeHigh) + minorStopBuffer;
+      if(breakoutSellSl <= bid)
+         breakoutSellSl = bid + TradeStopLossPips * pip;
+      double minBreakoutSellSl = bid + (MinMinorStopLossPips * pip);
+      if(breakoutSellSl < minBreakoutSellSl)
+         breakoutSellSl = minBreakoutSellSl;
+      double breakoutSellTp = bid - TradeTakeProfitPips * pip;
+      if(trade.Sell(lot, _Symbol, bid, breakoutSellSl, breakoutSellTp, "Breakout_LL_Sell"))
+        {
+         lastSellTradeBarTime = currentSignalBarTime;
+         openTotal++;
+         openSell++;
+         canOpenMore = (openTotal < MaxSimultaneousTrades);
+        }
+     }
+   if(EnableRangeBreakoutEntries &&
+      canOpenMore &&
+      openBuy < hardMaxTradesPerSide &&
+      allowBreakoutBuyFromHh &&
+      isBreakoutUp &&
+      isBreakoutUpConfirmed &&
+      IsDirectionAllowedByStrongTrend(POSITION_TYPE_BUY) &&
+      (lastBuyTradeBarTime == 0 || canReenterBuy))
+     {
+      double breakoutBuySl = (lastLowPrice > 0.0 ? lastLowPrice : rangeLow) - minorStopBuffer;
+      if(breakoutBuySl >= ask)
+         breakoutBuySl = ask - TradeStopLossPips * pip;
+      double maxBreakoutBuySl = ask - (MinMinorStopLossPips * pip);
+      if(breakoutBuySl > maxBreakoutBuySl)
+         breakoutBuySl = maxBreakoutBuySl;
+      double breakoutBuyTp = ask + TradeTakeProfitPips * pip;
+      if(trade.Buy(lot, _Symbol, ask, breakoutBuySl, breakoutBuyTp, "Breakout_HH_Buy"))
+        {
+         lastBuyTradeBarTime = currentSignalBarTime;
+         openTotal++;
+         openBuy++;
+         canOpenMore = (openTotal < MaxSimultaneousTrades);
+        }
+     }
    if(isInLowerHalf && distToBuyLevel <= entryBuffer && distToBuyLevel <= distToSellLevel && allowBuyBySwingRelation)
      {
-      if(canOpenMore && openBuy < hardMaxTradesPerSide && (lastBuyTradeBarTime == 0 || canReenterBuy))
+      if(canOpenMore && openBuy < hardMaxTradesPerSide && IsDirectionAllowedByStrongTrend(POSITION_TYPE_BUY) && (lastBuyTradeBarTime == 0 || canReenterBuy))
         {
-         double sl = ask - slDistance;
-         double tp = ask + tpDistance;
+         double sl = (lastLowPrice > 0.0 ? lastLowPrice : rangeLow) - minorStopBuffer;
+         if(sl >= ask)
+            sl = ask - TradeStopLossPips * pip;
+         double maxBuySl = ask - (MinMinorStopLossPips * pip);
+         if(sl > maxBuySl)
+            sl = maxBuySl;
+         double tp = isWideRange ? rangeMid : rangeHigh;
+         if(tp <= ask)
+            tp = ask + TradeTakeProfitPips * pip;
          if(trade.Buy(lot, _Symbol, ask, sl, tp, "SwingRange_Buy"))
            {
-            lastBuyTradeBarTime = time[0];
+            lastBuyTradeBarTime = currentSignalBarTime;
             openTotal++;
             canOpenMore = (openTotal < MaxSimultaneousTrades);
            }
@@ -669,12 +872,19 @@ void ExecuteRangeTrading(const datetime &time[])
      }
    if(isInUpperHalf && distToSellLevel <= entryBuffer && distToSellLevel <= distToBuyLevel && allowSellBySwingRelation)
      {
-      if(canOpenMore && openSell < hardMaxTradesPerSide && (lastSellTradeBarTime == 0 || canReenterSell))
+      if(canOpenMore && openSell < hardMaxTradesPerSide && IsDirectionAllowedByStrongTrend(POSITION_TYPE_SELL) && (lastSellTradeBarTime == 0 || canReenterSell))
         {
-         double sl = bid + slDistance;
-         double tp = bid - tpDistance;
+         double sl = (lastHighPrice > 0.0 ? lastHighPrice : rangeHigh) + minorStopBuffer;
+         if(sl <= bid)
+            sl = bid + TradeStopLossPips * pip;
+         double minSellSl = bid + (MinMinorStopLossPips * pip);
+         if(sl < minSellSl)
+            sl = minSellSl;
+         double tp = isWideRange ? rangeMid : rangeLow;
+         if(tp >= bid)
+            tp = bid - TradeTakeProfitPips * pip;
          if(trade.Sell(lot, _Symbol, bid, sl, tp, "SwingRange_Sell"))
-            lastSellTradeBarTime = time[0];
+            lastSellTradeBarTime = currentSignalBarTime;
         }
      }
   }
@@ -745,6 +955,7 @@ int OnInit()
    trade.SetExpertMagicNumber((long)TradeMagicNumber);
    trade.SetDeviationInPoints(20);
    reentryAtrHandle = iATR(_Symbol, _Period, ReentryAtrPeriod);
+   dynamicTargetMaHandle = iMA(_Symbol, _Period, MathMax(1, DynamicTargetMaPeriod), 0, MODE_EMA, PRICE_CLOSE);
    
    //  توضیح فارسی
    CalculateEffectiveValues();
@@ -758,6 +969,7 @@ int OnInit()
    
    //  توضیح فارسی
    currentTrend = TREND_RANGE;
+   isStrongTrendState = false;
    swingHistoryCount = 0;
    for(int i = 0; i < 8; i++)
      {
@@ -819,6 +1031,11 @@ void OnDeinit(const int reason)
      {
       IndicatorRelease(reentryAtrHandle);
       reentryAtrHandle = INVALID_HANDLE;
+     }
+   if(dynamicTargetMaHandle != INVALID_HANDLE)
+     {
+      IndicatorRelease(dynamicTargetMaHandle);
+      dynamicTargetMaHandle = INVALID_HANDLE;
      }
    //  توضیح فارسی
    EventKillTimer();
@@ -1042,6 +1259,7 @@ int ProcessSwingLogic(const int rates_total,
       
       //  توضیح فارسی
       currentTrend = TREND_RANGE;
+      isStrongTrendState = false;
       swingHistoryCount = 0;
       for(int i = 0; i < 8; i++)
         {
@@ -2752,6 +2970,7 @@ void AnalyzeTrend()
    if(swingHistoryCount < TrendAnalysisPeriod)
      {
       currentTrend = TREND_RANGE;
+      isStrongTrendState = false;
       Print("趋势分析：摆动点数量不足，当前=", swingHistoryCount, ", 需要=", TrendAnalysisPeriod);
       return;
      }
@@ -2782,6 +3001,7 @@ void AnalyzeTrend()
    if(highCount < 2 || lowCount < 2)
      {
       currentTrend = TREND_RANGE;
+      isStrongTrendState = false;
       Print("趋势分析：高低点数量不足 - 高点=", highCount, ", 低点=", lowCount, " (各需要>=2)");
       return;
      }
@@ -2810,16 +3030,19 @@ void AnalyzeTrend()
    if(highsRising && lowsRising)
      {
       currentTrend = TREND_UP;
+      isStrongTrendState = (lows[0] > highs[1]);
       Print("趋势分析：上升趋势 (HH + HL) - 高点上升:", highsRising, ", 低点上升:", lowsRising);
      }
    else if(highsFalling && lowsFalling)
      {
       currentTrend = TREND_DOWN;
+      isStrongTrendState = (highs[0] < lows[1]);
       Print("趋势分析：下降趋势 (LH + LL) - 高点下降:", highsFalling, ", 低点下降:", lowsFalling);
      }
    else
      {
       currentTrend = TREND_RANGE;
+      isStrongTrendState = false;
       Print("趋势分析：交易区间 (混合模式) - 高点上升:", highsRising, ", 高点下降:", highsFalling, ", 低点上升:", lowsRising, ", 低点下降:", lowsFalling);
      }
    
@@ -2856,11 +3079,11 @@ void UpdateTrendLabel()
    switch(currentTrend)
      {
       case TREND_UP:
-         trendText = "趋势：上升 ↗";
+         trendText = isStrongTrendState ? "趋势：上升强 ↗" : "趋势：上升弱 ↗";
          trendColor = UpTrendColor;
          break;
       case TREND_DOWN:
-         trendText = "趋势：下降 ↘";
+         trendText = isStrongTrendState ? "趋势：下降强 ↘" : "趋势：下降弱 ↘";
          trendColor = DownTrendColor;
          break;
       case TREND_RANGE:
